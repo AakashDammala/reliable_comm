@@ -1,0 +1,5 @@
+Diagnostics:
+  Suppress:
+    - misc-unused-includes
+    - unused-parameter
+    - clangd-unused-includes

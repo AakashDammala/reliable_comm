@@ -1,0 +1,15 @@
+BasedOnStyle: Google
+
+# --- Minimal ROS-friendly tweaks ---
+BreakBeforeBraces: Allman
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+BinPackArguments: false
+BinPackParameters: false
+
+IncludeBlocks: Regroup
+SortIncludes: true
