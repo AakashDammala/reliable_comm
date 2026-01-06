@@ -1,40 +1,198 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <random>
 #include <rclcpp/time.hpp>
 #include <string>
 
+#include "geometry_msgs/msg/twist_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "reliable_comm/reliable_pub.hpp"
 #include "sensor_msgs/msg/image.hpp"
 
 using namespace std::chrono_literals;
 
-typedef sensor_msgs::msg::Image msg_type;
+typedef sensor_msgs::msg::Image ImageMsg;
+typedef geometry_msgs::msg::TwistStamped TwistMsg;
 
 class RegularPub : public rclcpp::Node
 {
  public:
-  RegularPub() : Node("regular_pub"), count_(0)
+  RegularPub() : Node("regular_pub"), image_msg_count_(0), twist_msg_count_(0)
   {
-    publisher_ = this->create_publisher<msg_type>("/image", 10);
-    timer_ = this->create_wall_timer(
-        2s, std::bind(&RegularPub::timer_callback, this));
+    // Declare image parameters with defaults
+    this->declare_parameter<int>("image_publish_frequency", 30);
+    this->declare_parameter<std::string>("image_size", "720p");
+    this->declare_parameter<int>("image_num_messages", 10000);
+
+    // Declare twist parameters with defaults
+    this->declare_parameter<int>("twist_publish_frequency", 30);
+    this->declare_parameter<int>("twist_num_messages", 10000);
+
+    // Create publishers
+    image_publisher_ = this->create_publisher<ImageMsg>("/image", 10);
+    twist_publisher_ = this->create_publisher<TwistMsg>("/twist", 10);
+
+    // Get image parameters
+    int image_frequency =
+        this->get_parameter("image_publish_frequency").as_int();
+    std::string size = this->get_parameter("image_size").as_string();
+    image_num_messages_ = this->get_parameter("image_num_messages").as_int();
+
+    // Get twist parameters
+    int twist_frequency =
+        this->get_parameter("twist_publish_frequency").as_int();
+    twist_num_messages_ = this->get_parameter("twist_num_messages").as_int();
+
+    // Set image dimensions based on size parameter
+    if (size == "1080p")
+    {
+      width_ = 1920;
+      height_ = 1080;
+    }
+    else
+    {
+      // Default to 720p
+      width_ = 1280;
+      height_ = 720;
+    }
+
+    // Start image timer only if frequency > 0
+    if (image_frequency > 0)
+    {
+      auto image_period_ms = std::chrono::milliseconds(1000 / image_frequency);
+      RCLCPP_INFO(this->get_logger(),
+                  "Starting image publisher: %d Hz, %s (%dx%d), %d messages",
+                  image_frequency,
+                  size.c_str(),
+                  width_,
+                  height_,
+                  image_num_messages_);
+      image_timer_ = this->create_wall_timer(
+          image_period_ms,
+          std::bind(&RegularPub::generate_publish_image, this));
+    }
+    else
+    {
+      RCLCPP_INFO(this->get_logger(),
+                  "Image publisher disabled (frequency <= 0)");
+    }
+
+    // Start twist timer only if frequency > 0
+    if (twist_frequency > 0)
+    {
+      auto twist_period_ms = std::chrono::milliseconds(1000 / twist_frequency);
+      RCLCPP_INFO(this->get_logger(),
+                  "Starting twist publisher: %d Hz, %d messages",
+                  twist_frequency,
+                  twist_num_messages_);
+      twist_timer_ = this->create_wall_timer(
+          twist_period_ms,
+          std::bind(&RegularPub::generate_publish_twist, this));
+    }
+    else
+    {
+      RCLCPP_INFO(this->get_logger(),
+                  "Twist publisher disabled (frequency <= 0)");
+    }
   }
 
  private:
-  void timer_callback()
+  void generate_publish_image()
   {
+    if (image_msg_count_ >= image_num_messages_)
+    {
+      RCLCPP_INFO(this->get_logger(),
+                  "Published all %d image messages, stopping.",
+                  image_num_messages_);
+      image_timer_->cancel();
+      return;
+    }
+
     auto msg = sensor_msgs::msg::Image();
-    msg.data.push_back(count_);
+
+    // Set header with timestamp
     msg.header.stamp = this->now();
-    count_++;
-    publisher_->publish(msg);
+    msg.header.frame_id = std::to_string(image_msg_count_);
+
+    // Set image metadata
+    msg.width = width_;
+    msg.height = height_;
+    msg.encoding = "rgb8";
+    msg.is_bigendian = false;
+    msg.step = width_ * 3;  // 3 bytes per pixel (RGB)
+
+    // Generate random image data
+    size_t data_size = height_ * msg.step;
+    msg.data.resize(data_size);
+
+    // Fill with random data
+    // std::random_device rd;
+    // std::mt19937 gen(rd());
+    // std::uniform_int_distribution<uint8_t> dist(0, 255);
+    // for (size_t i = 0; i < data_size; ++i)
+    // {
+    //   msg.data[i] = dist(gen);
+    // }
+
+    image_publisher_->publish(msg);
+    image_msg_count_++;
+
+    if (image_msg_count_ % 1000 == 0)
+    {
+      RCLCPP_INFO(
+          this->get_logger(), "Published %d image messages", image_msg_count_);
+    }
   }
 
-  rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::Publisher<msg_type>::SharedPtr publisher_;
-  uint32_t count_;
+  void generate_publish_twist()
+  {
+    if (twist_msg_count_ >= twist_num_messages_)
+    {
+      RCLCPP_INFO(this->get_logger(),
+                  "Published all %d twist messages, stopping.",
+                  twist_num_messages_);
+      twist_timer_->cancel();
+      return;
+    }
+
+    auto msg = geometry_msgs::msg::TwistStamped();
+
+    // Set header with timestamp
+    msg.header.stamp = this->now();
+    msg.header.frame_id = std::to_string(twist_msg_count_);
+
+    // Set twist values (random or fixed values)
+    msg.twist.linear.x = 1.0;
+    msg.twist.linear.y = 0.0;
+    msg.twist.linear.z = 0.0;
+    msg.twist.angular.x = 0.0;
+    msg.twist.angular.y = 0.0;
+    msg.twist.angular.z = 0.5;
+
+    twist_publisher_->publish(msg);
+    twist_msg_count_++;
+
+    if (twist_msg_count_ % 1000 == 0)
+    {
+      RCLCPP_INFO(
+          this->get_logger(), "Published %d twist messages", twist_msg_count_);
+    }
+  }
+
+  // Image members
+  rclcpp::TimerBase::SharedPtr image_timer_;
+  rclcpp::Publisher<ImageMsg>::SharedPtr image_publisher_;
+  int image_msg_count_;
+  int image_num_messages_;
+  uint32_t width_;
+  uint32_t height_;
+
+  // Twist members
+  rclcpp::TimerBase::SharedPtr twist_timer_;
+  rclcpp::Publisher<TwistMsg>::SharedPtr twist_publisher_;
+  int twist_msg_count_;
+  int twist_num_messages_;
 };
 
 int main(int argc, char* argv[])
@@ -50,7 +208,7 @@ int main(int argc, char* argv[])
 
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(main_node);
-  executor.add_node(reliable_pub_node);
+  // executor.add_node(reliable_pub_node);
   executor.spin();
 
   rclcpp::shutdown();
