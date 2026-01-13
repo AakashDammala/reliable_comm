@@ -1,0 +1,38 @@
+services:
+  pub:
+    build:
+      context: ..
+      dockerfile: perf_test/Dockerfile
+    networks:
+      - perf_net
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 5G
+    volumes:
+      - ./results:/results
+    command: [ "ros2", "run", "reliable_comm", "regular_pub" ]
+
+  sub:
+    build:
+      context: ..
+      dockerfile: perf_test/Dockerfile
+    networks:
+      - perf_net
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    volumes:
+      - ./results:/results
+    command: [ "ros2", "run", "reliable_comm", "regular_sub" ]
+
+networks:
+  perf_net:
+    driver: bridge

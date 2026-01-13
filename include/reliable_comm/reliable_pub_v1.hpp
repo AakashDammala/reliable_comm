@@ -1,10 +1,10 @@
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <rclcpp/serialized_message.hpp>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -13,22 +13,25 @@
 
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/serialization.hpp"
+#include "reliable_comm/msg/reliable_envelope.hpp"
 #include "rmw/types.h"
 #include "std_msgs/msg/int64.hpp"
 
 using namespace std::chrono_literals;
 
+// Use Int64 for feedback to match msg_num type (uint64)
 typedef std_msgs::msg::Int64 feedback_msg;
+
+// Alias for the envelope type
+using Envelope = reliable_comm::msg::ReliableEnvelope;
 
 template <typename T>
 class ReliablePub : public rclcpp::Node
 {
  public:
   ReliablePub(std::string& node_name, std::string& input_topic_name)
-      : Node(node_name),
-        input_topic_name_(input_topic_name),
-        last_feedback_time_(std::chrono::steady_clock::now()),
-        publishing_complete_(false)
+      : Node(node_name), input_topic_name_(input_topic_name), msg_num_(0)
   {
     // input: '/image'   publish: '/rp_image'   feedback: '/rf_image'
     publish_topic_name_ = "/rp_" + input_topic_name_.substr(1);
@@ -37,7 +40,7 @@ class ReliablePub : public rclcpp::Node
     // BEST_EFFORT QoS with large buffer - let our layer handle reliability
     auto qos = rclcpp::QoS(1000).best_effort();
 
-    rp_pub_ = this->create_publisher<T>(publish_topic_name_, qos);
+    rp_pub_ = this->create_publisher<Envelope>(publish_topic_name_, qos);
 
     feedback_sub_ = this->create_subscription<feedback_msg>(
         feedback_topic_name_,
@@ -63,60 +66,45 @@ class ReliablePub : public rclcpp::Node
     }
   }
 
-  // Called by external node to signal that all messages have been published
-  void set_publishing_complete()
-  {
-    publishing_complete_ = true;
-    last_feedback_time_ = std::chrono::steady_clock::now();
-    RCLCPP_INFO(this->get_logger(),
-                "Publishing complete, will shutdown after 60s of no feedback");
-  }
-
  private:
   void msg_cb(const typename T::ConstSharedPtr msg_ptr,
-              const rclcpp::MessageInfo& info)
+              const rclcpp::MessageInfo& /* info */)
   {
-    uint64_t unique_id =
-        info.get_rmw_message_info().publication_sequence_number;
+    // Serialize the message
+    rclcpp::Serialization<T> serializer;
+    rclcpp::SerializedMessage serialized_msg;
+    serializer.serialize_message(msg_ptr.get(), &serialized_msg);
 
-    unique_id = (static_cast<uint64_t>(msg_ptr->header.stamp.sec) << 32) |
-                msg_ptr->header.stamp.nanosec;
+    // Create envelope with msg_num
+    auto envelope = std::make_shared<Envelope>();
+    envelope->msg_num = msg_num_;
 
-    if (unique_id == 0)
+    // Get the serialized buffer and assign to envelope
+    auto& rcl_msg = serialized_msg.get_rcl_serialized_message();
+    envelope->serialized_data.assign(rcl_msg.buffer,
+                                     rcl_msg.buffer + rcl_msg.buffer_length);
+
+    // Store the envelope in msg_storage_
     {
-      RCLCPP_WARN(this->get_logger(),
-                  "Message has no timestamp or sequence number!");
-      return;
+      std::lock_guard<std::mutex> lock(msg_storage_mutex_);
+      msg_storage_.emplace(msg_num_, envelope);
     }
 
-    // just store the pointer, don't make a copy
-    msg_storage_mutex_.lock();
-    auto inserted = msg_storage_.emplace(unique_id, msg_ptr);
-    msg_storage_mutex_.unlock();
+    RCLCPP_INFO(this->get_logger(), "Stored msg ID: %lu", msg_num_);
 
-    if (inserted.second)
-    {
-      RCLCPP_INFO(this->get_logger(), "Stored msg ID: %lu", unique_id);
-      publish_msg(msg_ptr);
-    }
-    else
-    {
-      RCLCPP_DEBUG(this->get_logger(),
-                   "Duplicate ID %lu received, ignoring.",
-                   unique_id);
-    }
+    // Publish the envelope
+    publish_msg(envelope);
+
+    msg_num_++;
   }
 
   void feedback_cb(const feedback_msg::ConstSharedPtr msg_ptr)
   {
     RCLCPP_INFO(this->get_logger(), "Feedback received: %ld", msg_ptr->data);
 
-    // Update last feedback time
-    last_feedback_time_ = std::chrono::steady_clock::now();
-
     std::lock_guard<std::mutex> lock(msg_storage_mutex_);
 
-    uint64_t unique_id = msg_ptr->data;
+    uint64_t unique_id = static_cast<uint64_t>(msg_ptr->data);
     auto it = msg_storage_.find(unique_id);
 
     if (it != msg_storage_.end())
@@ -124,15 +112,13 @@ class ReliablePub : public rclcpp::Node
       msg_storage_.erase(it);
 
       RCLCPP_INFO(this->get_logger(),
-                  "Got feedback for %lu, removing msg from storage. %zu "
-                  "remaining.",
-                  unique_id,
-                  msg_storage_.size());
+                  "Got feedback for %lu, removing msg from storage.",
+                  unique_id);
     }
     else
     {
       RCLCPP_WARN(this->get_logger(),
-                  "Feedback for unique id: %ld received, but it is not present "
+                  "Feedback for unique id: %lu received, but it is not present "
                   "in msg_storage_",
                   unique_id);
     }
@@ -141,41 +127,12 @@ class ReliablePub : public rclcpp::Node
   void re_publisher_function()
   {
     rclcpp::Rate loop_rate(1.0);
-    constexpr int IDLE_TIMEOUT_SEC = 60;
 
     while (rclcpp::ok())
     {
       msg_storage_mutex_.lock();
       size_t num_msg_in_storage = msg_storage_.size();
       msg_storage_mutex_.unlock();
-
-      // Check for idle timeout after publishing is complete
-      if (publishing_complete_)
-      {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                           now - last_feedback_time_)
-                           .count();
-
-        // If all messages acknowledged or idle for 60 seconds, shutdown
-        if (num_msg_in_storage == 0)
-        {
-          RCLCPP_INFO(this->get_logger(),
-                      "All messages acknowledged, shutting down");
-          rclcpp::shutdown();
-          return;
-        }
-        else if (elapsed >= IDLE_TIMEOUT_SEC)
-        {
-          RCLCPP_WARN(this->get_logger(),
-                      "No feedback for %ld seconds with %zu unacked messages, "
-                      "shutting down",
-                      elapsed,
-                      num_msg_in_storage);
-          rclcpp::shutdown();
-          return;
-        }
-      }
 
       if (num_msg_in_storage > 0)
       {
@@ -192,6 +149,7 @@ class ReliablePub : public rclcpp::Node
           publish_msg(msg_ptr);
           count++;
 
+          // slight delay, to not just dump all msgs at once
           rclcpp::sleep_for(std::chrono::milliseconds(2));
         }
       }
@@ -200,7 +158,7 @@ class ReliablePub : public rclcpp::Node
     }
   }
 
-  void publish_msg(typename T::ConstSharedPtr msg)
+  void publish_msg(Envelope::ConstSharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(rp_pub_mutex_);
 
@@ -211,17 +169,15 @@ class ReliablePub : public rclcpp::Node
   }
 
   typename rclcpp::Subscription<T>::SharedPtr msg_sub_;
-  typename rclcpp::Publisher<T>::SharedPtr rp_pub_;
+  typename rclcpp::Publisher<Envelope>::SharedPtr rp_pub_;
   rclcpp::Subscription<feedback_msg>::SharedPtr feedback_sub_;
   std::thread re_publisher_thread_;
 
-  std::unordered_map<uint64_t, typename T::ConstSharedPtr> msg_storage_;
+  std::unordered_map<uint64_t, typename std::shared_ptr<Envelope>> msg_storage_;
 
   std::mutex rp_pub_mutex_, msg_storage_mutex_;
 
   std::string input_topic_name_, publish_topic_name_, feedback_topic_name_;
 
-  // Idle timeout tracking
-  std::chrono::steady_clock::time_point last_feedback_time_;
-  std::atomic<bool> publishing_complete_;
+  uint64_t msg_num_;
 };

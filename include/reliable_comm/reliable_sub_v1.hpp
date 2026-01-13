@@ -10,12 +10,17 @@
 
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/serialization.hpp"
+#include "reliable_comm/msg/reliable_envelope.hpp"
 #include "rmw/types.h"
 #include "std_msgs/msg/int64.hpp"
 
 using namespace std::chrono_literals;
 
 typedef std_msgs::msg::Int64 feedback_msg;
+
+// Alias for the envelope type
+using Envelope = reliable_comm::msg::ReliableEnvelope;
 
 template <typename T>
 class ReliableSub : public rclcpp::Node
@@ -33,56 +38,70 @@ class ReliableSub : public rclcpp::Node
     // BEST_EFFORT QoS with large buffer - let our layer handle reliability
     auto qos = rclcpp::QoS(1000).best_effort();
 
+    // Publisher for deserialized messages
     rs_pub_ = this->create_publisher<T>(publish_topic_name_, qos);
 
+    // Publisher for feedback (ACK)
     rf_pub_ = this->create_publisher<feedback_msg>(feedback_topic_name_, qos);
 
-    rp_sub_ = this->create_subscription<T>(
+    // Subscribe to envelope topic
+    rp_sub_ = this->create_subscription<Envelope>(
         subscribe_topic_name_,
         qos,
-        [this](const typename T::ConstSharedPtr msg,
+        [this](const Envelope::ConstSharedPtr msg,
                const rclcpp::MessageInfo& info) { this->rp_cb(msg, info); });
 
     RCLCPP_INFO(this->get_logger(), "Started the node");
   }
 
  private:
-  void rp_cb(const typename T::ConstSharedPtr msg_ptr,
-             const rclcpp::MessageInfo& info)
+  void rp_cb(const Envelope::ConstSharedPtr envelope_ptr,
+             const rclcpp::MessageInfo& /* info */)
   {
-    uint64_t unique_id =
-        info.get_rmw_message_info().publication_sequence_number;
+    uint64_t msg_num = envelope_ptr->msg_num;
 
-    unique_id = (static_cast<uint64_t>(msg_ptr->header.stamp.sec) << 32) |
-                msg_ptr->header.stamp.nanosec;
-
-    RCLCPP_INFO(this->get_logger(), "Got message %lu", unique_id);
-
-    // check if the message has already been received?
-    auto it = received_msg_set_.find(unique_id);
+    // Check if the message has already been received
+    auto it = received_msg_set_.find(msg_num);
     if (it == received_msg_set_.end())  // msg not received earlier
     {
-      received_msg_set_.emplace(unique_id);
+      received_msg_set_.emplace(msg_num);
 
-      RCLCPP_INFO(this->get_logger(), "Publishing msg with id: %lu", unique_id);
-      rs_pub_->publish(*msg_ptr);
+      // Deserialize the payload to the original message type
+      rclcpp::Serialization<T> serializer;
+
+      // Create SerializedMessage with proper capacity
+      size_t data_size = envelope_ptr->serialized_data.size();
+      rclcpp::SerializedMessage serialized_msg(data_size);
+
+      // Get reference and copy data
+      auto& rcl_msg = serialized_msg.get_rcl_serialized_message();
+      std::memcpy(
+          rcl_msg.buffer, envelope_ptr->serialized_data.data(), data_size);
+      rcl_msg.buffer_length = data_size;
+
+      // Deserialize to message type T
+      T deserialized_msg;
+      serializer.deserialize_message(&serialized_msg, &deserialized_msg);
+
+      RCLCPP_INFO(this->get_logger(), "Publishing msg with id: %lu", msg_num);
+      rs_pub_->publish(deserialized_msg);
     }
     else
     {
       RCLCPP_INFO(this->get_logger(),
                   "Msg with id: %lu already passed forward, not passing again.",
-                  unique_id);
+                  msg_num);
     }
 
-    // send feedback that the msg is received
+    // Send feedback that the msg is received
     RCLCPP_INFO(
-        this->get_logger(), "Publishing feedback with id: %lu", unique_id);
+        this->get_logger(), "Publishing feedback with id: %lu", msg_num);
     feedback_msg fb_msg;
-    fb_msg.data = unique_id;
+    fb_msg.data = static_cast<int64_t>(msg_num);
     rf_pub_->publish(fb_msg);
   }
 
-  typename rclcpp::Subscription<T>::SharedPtr rp_sub_;
+  typename rclcpp::Subscription<Envelope>::SharedPtr rp_sub_;
   typename rclcpp::Publisher<T>::SharedPtr rs_pub_;
   typename rclcpp::Publisher<feedback_msg>::SharedPtr rf_pub_;
 

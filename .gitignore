@@ -2,4 +2,6 @@ build/
 .vscode/
 .cache/
 compile_commands.json
-
+install/
+log/
+perf_test/results/

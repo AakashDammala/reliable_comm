@@ -1,7 +1,9 @@
 #include <chrono>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
+#include <rclcpp/qos.hpp>
 #include <rclcpp/time.hpp>
 #include <string>
 
@@ -23,15 +25,21 @@ class RegularPub : public rclcpp::Node
     // Declare image parameters with defaults
     this->declare_parameter<int>("image_publish_frequency", 30);
     this->declare_parameter<std::string>("image_size", "720p");
-    this->declare_parameter<int>("image_num_messages", 10000);
+    this->declare_parameter<int>("image_num_messages", 500);
 
     // Declare twist parameters with defaults
     this->declare_parameter<int>("twist_publish_frequency", 30);
-    this->declare_parameter<int>("twist_num_messages", 10000);
+    this->declare_parameter<int>("twist_num_messages", 0);
 
-    // Create publishers
-    image_publisher_ = this->create_publisher<ImageMsg>("/image", 10);
-    twist_publisher_ = this->create_publisher<TwistMsg>("/twist", 10);
+    // Output file for stats
+    this->declare_parameter<std::string>("output_file", "");
+    this->declare_parameter<int>("timeout_sec", 120);
+    output_file_ = this->get_parameter("output_file").as_string();
+    int timeout_sec = this->get_parameter("timeout_sec").as_int();
+
+    auto qos = rclcpp::QoS(1000).best_effort();
+    image_publisher_ = this->create_publisher<ImageMsg>("/image", qos);
+    twist_publisher_ = this->create_publisher<TwistMsg>("/twist", qos);
 
     // Get image parameters
     int image_frequency =
@@ -50,12 +58,49 @@ class RegularPub : public rclcpp::Node
       width_ = 1920;
       height_ = 1080;
     }
-    else
+    else if (size == "720p")
     {
-      // Default to 720p
       width_ = 1280;
       height_ = 720;
     }
+    else if (size == "480p")
+    {
+      width_ = 640;
+      height_ = 480;
+    }
+    else if (size == "240p")
+    {
+      width_ = 320;
+      height_ = 240;
+    }
+    else if (size == "120p")
+    {
+      width_ = 160;
+      height_ = 120;
+    }
+    else if (size == "96p")
+    {
+      width_ = 96;
+      height_ = 96;
+    }
+    else if (size == "64p")
+    {
+      width_ = 64;
+      height_ = 64;
+    }
+    else
+    {
+      width_ = 32;
+      height_ = 32;
+    }
+
+    // Startup delay to allow tc rules to be applied before publishing
+    this->declare_parameter<int>("startup_delay_sec", 4);
+    int startup_delay = this->get_parameter("startup_delay_sec").as_int();
+    RCLCPP_INFO(this->get_logger(),
+                "Waiting %d seconds before starting publishers...",
+                startup_delay);
+    rclcpp::sleep_for(std::chrono::seconds(startup_delay));
 
     // Start image timer only if frequency > 0
     if (image_frequency > 0)
@@ -95,6 +140,13 @@ class RegularPub : public rclcpp::Node
       RCLCPP_INFO(this->get_logger(),
                   "Twist publisher disabled (frequency <= 0)");
     }
+
+    // Shutdown timer
+    shutdown_timer_ =
+        this->create_wall_timer(std::chrono::seconds(timeout_sec),
+                                std::bind(&RegularPub::on_timeout, this));
+    RCLCPP_INFO(
+        this->get_logger(), "Will shutdown after %d seconds", timeout_sec);
   }
 
  private:
@@ -106,6 +158,8 @@ class RegularPub : public rclcpp::Node
                   "Published all %d image messages, stopping.",
                   image_num_messages_);
       image_timer_->cancel();
+      write_stats();
+      // rclcpp::shutdown();
       return;
     }
 
@@ -135,6 +189,8 @@ class RegularPub : public rclcpp::Node
     //   msg.data[i] = dist(gen);
     // }
 
+    RCLCPP_INFO(
+        this->get_logger(), "Publishing image message %d", image_msg_count_);
     image_publisher_->publish(msg);
     image_msg_count_++;
 
@@ -153,6 +209,7 @@ class RegularPub : public rclcpp::Node
                   "Published all %d twist messages, stopping.",
                   twist_num_messages_);
       twist_timer_->cancel();
+      write_stats();
       return;
     }
 
@@ -193,6 +250,26 @@ class RegularPub : public rclcpp::Node
   rclcpp::Publisher<TwistMsg>::SharedPtr twist_publisher_;
   int twist_msg_count_;
   int twist_num_messages_;
+  std::string output_file_;
+  rclcpp::TimerBase::SharedPtr shutdown_timer_;
+
+  void on_timeout()
+  {
+    RCLCPP_INFO(this->get_logger(), "Timeout reached, shutting down");
+    write_stats();
+    rclcpp::shutdown();
+  }
+
+  void write_stats()
+  {
+    if (output_file_.empty())
+      return;
+    std::ofstream f(output_file_);
+    f << "{\"total_published\": " << image_msg_count_ << "}";
+    f.close();
+    RCLCPP_INFO(
+        this->get_logger(), "Stats written to %s", output_file_.c_str());
+  }
 };
 
 int main(int argc, char* argv[])
@@ -208,7 +285,7 @@ int main(int argc, char* argv[])
 
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(main_node);
-  // executor.add_node(reliable_pub_node);
+  executor.add_node(reliable_pub_node);
   executor.spin();
 
   rclcpp::shutdown();
