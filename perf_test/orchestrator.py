@@ -44,19 +44,21 @@ TEST_CASES = [
     {
         "name": "loss_30pct",
         "tc_args": "loss 30%",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "32p"
     },
     {
-        "name": "loss_50pct",
-        "tc_args": "loss 50%",
-        "timeout_buffer_sec": 480,
+        "name": "blackout_10s_every_40s",
+        "tc_args": "periodic_blackout",
+        "blackout_on_sec": 10,      # 10 seconds of 100% packet loss
+        "blackout_off_sec": 40,     # 40 seconds normal
+        "timeout_buffer_sec": 420,
         "image_size": "32p"
     },
     {
         "name": "delay_100ms",
         "tc_args": "delay 100ms",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "32p"
     },
     {
@@ -74,19 +76,21 @@ TEST_CASES = [
     {
         "name": "loss_30pct",
         "tc_args": "loss 30%",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "240p"
     },
     {
-        "name": "loss_50pct",
-        "tc_args": "loss 50%",
-        "timeout_buffer_sec": 480,
+        "name": "blackout_10s_every_40s",
+        "tc_args": "periodic_blackout",
+        "blackout_on_sec": 10,      # 10 seconds of 100% packet loss
+        "blackout_off_sec": 40,     # 40 seconds normal
+        "timeout_buffer_sec": 420,
         "image_size": "240p"
     },
     {
         "name": "delay_100ms",
         "tc_args": "delay 100ms",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "240p"
     },
     {
@@ -104,19 +108,21 @@ TEST_CASES = [
     {
         "name": "loss_30pct",
         "tc_args": "loss 30%",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "720p"
     },
     {
-        "name": "loss_50pct",
-        "tc_args": "loss 50%",
-        "timeout_buffer_sec": 480,
+        "name": "blackout_10s_every_40s",
+        "tc_args": "periodic_blackout",
+        "blackout_on_sec": 10,      # 10 seconds of 100% packet loss
+        "blackout_off_sec": 40,     # 40 seconds normal
+        "timeout_buffer_sec": 420,
         "image_size": "720p"
     },
     {
         "name": "delay_100ms",
         "tc_args": "delay 100ms",
-        "timeout_buffer_sec": 480,
+        "timeout_buffer_sec": 420,
         "image_size": "720p"
     },
 ]
@@ -230,6 +236,38 @@ def remove_tc(containers):
         subprocess.run(cmd, check=False, capture_output=True)
 
 
+def apply_periodic_blackout(containers, on_sec, off_sec, stop_event):
+    """Apply periodic blackout: 100% loss for on_sec, then normal for off_sec."""
+    cycle_num = 0
+    while not stop_event.is_set():
+        # Blackout ON - 100% packet loss
+        cycle_num += 1
+        print(f"[BLACKOUT] Cycle {cycle_num}: ON (100% loss for {on_sec}s)")
+        for container in containers:
+            cmd = ["docker", "exec", container, "tc", "qdisc", "replace",
+                   "dev", "eth0", "root", "netem", "loss", "100%"]
+            subprocess.run(cmd, capture_output=True)
+        
+        # Wait for blackout duration (check stop_event periodically)
+        for _ in range(on_sec * 10):
+            if stop_event.is_set():
+                return
+            time.sleep(0.1)
+        
+        # Blackout OFF - remove loss
+        print(f"[BLACKOUT] Cycle {cycle_num}: OFF (normal for {off_sec}s)")
+        for container in containers:
+            cmd = ["docker", "exec", container, "tc", "qdisc", "replace",
+                   "dev", "eth0", "root", "netem", "delay", "0ms"]
+            subprocess.run(cmd, capture_output=True)
+        
+        # Wait for normal duration
+        for _ in range(off_sec * 10):
+            if stop_event.is_set():
+                return
+            time.sleep(0.1)
+
+
 def collect_docker_stats(stop_event, stats_list):
     """Collect docker stats in background thread."""
     while not stop_event.is_set():
@@ -338,10 +376,31 @@ def run_test(test_case):
         
         # Apply tc rules for network faults
         time.sleep(2)  # Wait for containers to be ready
-        apply_tc(test_case.get("tc_args"), ["perf_pub", "perf_sub"])
+        
+        # Check if this is a periodic blackout test
+        blackout_thread = None
+        blackout_stop_event = threading.Event()
+        tc_args = test_case.get("tc_args")
+        
+        if tc_args == "periodic_blackout":
+            on_sec = test_case.get("blackout_on_sec", 10)
+            off_sec = test_case.get("blackout_off_sec", 40)
+            print(f"[TC] Starting periodic blackout: {on_sec}s on / {off_sec}s off")
+            blackout_thread = threading.Thread(
+                target=apply_periodic_blackout,
+                args=(["perf_pub", "perf_sub"], on_sec, off_sec, blackout_stop_event)
+            )
+            blackout_thread.start()
+        else:
+            apply_tc(tc_args, ["perf_pub", "perf_sub"])
         
         # Wait for completion (use same timeout + small buffer)
         completed = wait_for_completion(timeout=timeout_sec + 30)
+        
+        # Stop blackout thread if running
+        if blackout_thread:
+            blackout_stop_event.set()
+            blackout_thread.join(timeout=2)
         
         # Remove tc rules
         remove_tc(["perf_pub", "perf_sub"])
