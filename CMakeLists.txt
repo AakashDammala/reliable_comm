@@ -15,6 +15,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(cdcl_umd_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 # Generate custom messages
@@ -43,10 +44,30 @@ target_include_directories(regular_sub PRIVATE
 ament_target_dependencies(regular_sub rclcpp std_msgs sensor_msgs geometry_msgs)
 target_link_libraries(regular_sub "${cpp_typesupport_target}")
 
+add_executable(standalone_pub src/standalone_pub.cpp)
+target_include_directories(standalone_pub PRIVATE
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
+ament_target_dependencies(standalone_pub rclcpp std_msgs sensor_msgs geometry_msgs cdcl_umd_msgs)
+target_link_libraries(standalone_pub "${cpp_typesupport_target}")
+
+add_executable(standalone_sub src/standalone_sub.cpp)
+target_include_directories(standalone_sub PRIVATE
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
+ament_target_dependencies(standalone_sub rclcpp std_msgs sensor_msgs geometry_msgs cdcl_umd_msgs)
+target_link_libraries(standalone_sub "${cpp_typesupport_target}")
+
 install(TARGETS
   regular_pub
   regular_sub
+  standalone_pub
+  standalone_sub
   DESTINATION lib/${PROJECT_NAME})
+
+# Install launch files
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch)
 
 # Install header files so other packages can use them
 install(DIRECTORY include/
