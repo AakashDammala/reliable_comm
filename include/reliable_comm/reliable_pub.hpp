@@ -20,22 +20,34 @@ using namespace std::chrono_literals;
 
 typedef std_msgs::msg::Int64 feedback_msg;
 
+/**
+ * ReliablePub V0 - ACK-based reliable publisher
+ */
 template <typename T>
 class ReliablePub : public rclcpp::Node
 {
  public:
-  ReliablePub(std::string& node_name, std::string& input_topic_name)
+  ReliablePub(std::string& node_name,
+              std::string& input_topic_name,
+              size_t qos_history_depth = 1000,
+              size_t max_retries_per_loop = 25,
+              double retry_rate_hz = 1.0,
+              size_t max_storage_size = 1000)
       : Node(node_name),
         input_topic_name_(input_topic_name),
         last_feedback_time_(std::chrono::steady_clock::now()),
-        publishing_complete_(false)
+        publishing_complete_(false),
+        qos_history_depth_(qos_history_depth),
+        max_retries_per_loop_(max_retries_per_loop),
+        retry_rate_hz_(retry_rate_hz),
+        max_storage_size_(max_storage_size)
   {
     // input: '/image'   publish: '/rp_image'   feedback: '/rf_image'
     publish_topic_name_ = "/rp_" + input_topic_name_.substr(1);
     feedback_topic_name_ = "/rf_" + input_topic_name_.substr(1);
 
-    // BEST_EFFORT QoS with large buffer - let our layer handle reliability
-    auto qos = rclcpp::QoS(1000).best_effort();
+    // BEST_EFFORT QoS with configurable buffer
+    auto qos = rclcpp::QoS(qos_history_depth_).best_effort();
 
     rp_pub_ = this->create_publisher<T>(publish_topic_name_, qos);
 
@@ -53,6 +65,14 @@ class ReliablePub : public rclcpp::Node
                                                       this,
                                                       std::placeholders::_1,
                                                       std::placeholders::_2));
+
+    RCLCPP_INFO(this->get_logger(),
+                "ReliablePub V0 started: qos_depth=%zu, max_retries=%zu, "
+                "retry_rate=%.1fHz, max_storage=%zu",
+                qos_history_depth_,
+                max_retries_per_loop_,
+                retry_rate_hz_,
+                max_storage_size_);
   }
 
   ~ReliablePub()
@@ -90,21 +110,25 @@ class ReliablePub : public rclcpp::Node
     }
 
     // just store the pointer, don't make a copy
+    // Check storage size before adding
     msg_storage_mutex_.lock();
-    auto inserted = msg_storage_.emplace(unique_id, msg_ptr);
-    msg_storage_mutex_.unlock();
-
-    if (inserted.second)
+    if (msg_storage_.size() < max_storage_size_)
     {
+      msg_storage_.emplace(unique_id, msg_ptr);
+      msg_storage_mutex_.unlock();
       RCLCPP_INFO(this->get_logger(), "Stored msg ID: %lu", unique_id);
-      publish_msg(msg_ptr);
     }
     else
     {
-      RCLCPP_DEBUG(this->get_logger(),
-                   "Duplicate ID %lu received, ignoring.",
-                   unique_id);
+      msg_storage_mutex_.unlock();
+      RCLCPP_WARN(this->get_logger(),
+                  "Storage full (%zu), not storing msg ID: %lu",
+                  max_storage_size_,
+                  unique_id);
     }
+
+    // Always publish the envelope (even if not stored)
+    publish_msg(msg_ptr);
   }
 
   void feedback_cb(const feedback_msg::ConstSharedPtr msg_ptr)
@@ -140,7 +164,7 @@ class ReliablePub : public rclcpp::Node
 
   void re_publisher_function()
   {
-    rclcpp::Rate loop_rate(1.0);
+    rclcpp::Rate loop_rate(retry_rate_hz_);
     constexpr int IDLE_TIMEOUT_SEC = 60;
 
     while (rclcpp::ok())
@@ -182,11 +206,10 @@ class ReliablePub : public rclcpp::Node
         std::lock_guard<std::mutex> lock(msg_storage_mutex_);
 
         size_t count = 0;
-        constexpr size_t MAX_RETRIES_PER_LOOP = 25;
 
         for (auto const& [id, msg_ptr] : msg_storage_)
         {
-          if (count >= MAX_RETRIES_PER_LOOP)
+          if (count >= max_retries_per_loop_)
             break;
 
           publish_msg(msg_ptr);
@@ -224,4 +247,10 @@ class ReliablePub : public rclcpp::Node
   // Idle timeout tracking
   std::chrono::steady_clock::time_point last_feedback_time_;
   std::atomic<bool> publishing_complete_;
+
+  // Configurable parameters
+  size_t qos_history_depth_;
+  size_t max_retries_per_loop_;
+  double retry_rate_hz_;
+  size_t max_storage_size_;
 };

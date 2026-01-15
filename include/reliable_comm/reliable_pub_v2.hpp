@@ -35,15 +35,26 @@ template <typename T>
 class ReliablePub : public rclcpp::Node
 {
  public:
-  ReliablePub(std::string& node_name, std::string& input_topic_name)
-      : Node(node_name), input_topic_name_(input_topic_name), msg_num_(0)
+  ReliablePub(std::string& node_name,
+              std::string& input_topic_name,
+              size_t qos_history_depth = 1000,
+              size_t max_retries_per_loop = 25,
+              double retry_rate_hz = 1.0,
+              size_t max_storage_size = 1000)
+      : Node(node_name),
+        input_topic_name_(input_topic_name),
+        msg_num_(0),
+        qos_history_depth_(qos_history_depth),
+        max_retries_per_loop_(max_retries_per_loop),
+        retry_rate_hz_(retry_rate_hz),
+        max_storage_size_(max_storage_size)
   {
     // input: '/image'   publish: '/rp_image'   feedback: '/rf_image'
     publish_topic_name_ = "/rp_" + input_topic_name_.substr(1);
     feedback_topic_name_ = "/rf_" + input_topic_name_.substr(1);
 
-    // BEST_EFFORT QoS with large buffer - let our layer handle reliability
-    auto qos = rclcpp::QoS(1000).best_effort();
+    // BEST_EFFORT QoS with configurable buffer
+    auto qos = rclcpp::QoS(qos_history_depth_).best_effort();
 
     rp_pub_ = this->create_publisher<Envelope>(publish_topic_name_, qos);
 
@@ -61,6 +72,14 @@ class ReliablePub : public rclcpp::Node
                                                       this,
                                                       std::placeholders::_1,
                                                       std::placeholders::_2));
+
+    RCLCPP_INFO(this->get_logger(),
+                "ReliablePub started: qos_depth=%zu, max_retries=%zu, "
+                "retry_rate=%.1fHz, max_storage=%zu",
+                qos_history_depth_,
+                max_retries_per_loop_,
+                retry_rate_hz_,
+                max_storage_size_);
   }
 
   ~ReliablePub()
@@ -89,15 +108,24 @@ class ReliablePub : public rclcpp::Node
     envelope->serialized_data.assign(rcl_msg.buffer,
                                      rcl_msg.buffer + rcl_msg.buffer_length);
 
-    // Store the envelope in msg_storage_
+    // Check storage size before adding
     {
       std::lock_guard<std::mutex> lock(msg_storage_mutex_);
-      msg_storage_.emplace(msg_num_, envelope);
+      if (msg_storage_.size() < max_storage_size_)
+      {
+        msg_storage_.emplace(msg_num_, envelope);
+        RCLCPP_INFO(this->get_logger(), "Stored msg ID: %lu", msg_num_);
+      }
+      else
+      {
+        RCLCPP_WARN(this->get_logger(),
+                    "Storage full (%zu), not storing msg ID: %lu",
+                    max_storage_size_,
+                    msg_num_);
+      }
     }
 
-    RCLCPP_INFO(this->get_logger(), "Stored msg ID: %lu", msg_num_);
-
-    // Publish the envelope
+    // Always publish the envelope (even if not stored)
     publish_msg(envelope);
 
     msg_num_++;
@@ -142,7 +170,7 @@ class ReliablePub : public rclcpp::Node
 
   void re_publisher_function()
   {
-    rclcpp::Rate loop_rate(1.0);
+    rclcpp::Rate loop_rate(retry_rate_hz_);
 
     while (rclcpp::ok())
     {
@@ -155,11 +183,10 @@ class ReliablePub : public rclcpp::Node
         std::lock_guard<std::mutex> lock(msg_storage_mutex_);
 
         size_t count = 0;
-        constexpr size_t MAX_RETRIES_PER_LOOP = 25;
 
         for (auto const& [id, msg_ptr] : msg_storage_)
         {
-          if (count >= MAX_RETRIES_PER_LOOP)
+          if (count >= max_retries_per_loop_)
             break;
 
           publish_msg(msg_ptr);
@@ -196,4 +223,10 @@ class ReliablePub : public rclcpp::Node
   std::string input_topic_name_, publish_topic_name_, feedback_topic_name_;
 
   uint64_t msg_num_;
+
+  // Configurable parameters
+  size_t qos_history_depth_;
+  size_t max_retries_per_loop_;
+  double retry_rate_hz_;
+  size_t max_storage_size_;
 };

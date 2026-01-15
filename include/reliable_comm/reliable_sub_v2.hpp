@@ -34,8 +34,16 @@ template <typename T>
 class ReliableSub : public rclcpp::Node
 {
  public:
-  ReliableSub(std::string& node_name, std::string& input_topic_name)
-      : Node(node_name), input_topic_name_(input_topic_name), last_received_(0)
+  ReliableSub(std::string& node_name,
+              std::string& input_topic_name,
+              size_t qos_history_depth = 1000,
+              size_t /* max_retries_per_loop */ = 25,
+              double /* retry_rate_hz */ = 1.0,
+              size_t /* max_storage_size */ = 1000)
+      : Node(node_name),
+        input_topic_name_(input_topic_name),
+        last_received_(0),
+        qos_history_depth_(qos_history_depth)
   {
     // input: '/image'   subscribe: '/rp_image'   publish: '/rs_image'
     // feedback: '/rf_image'
@@ -43,8 +51,8 @@ class ReliableSub : public rclcpp::Node
     publish_topic_name_ = "/rs_" + input_topic_name_.substr(1);
     feedback_topic_name_ = "/rf_" + input_topic_name_.substr(1);
 
-    // BEST_EFFORT QoS with large buffer - let our layer handle reliability
-    auto qos = rclcpp::QoS(1000).best_effort();
+    // BEST_EFFORT QoS with configurable buffer
+    auto qos = rclcpp::QoS(qos_history_depth_).best_effort();
 
     // Publisher for deserialized messages
     rs_pub_ = this->create_publisher<T>(publish_topic_name_, qos);
@@ -59,7 +67,9 @@ class ReliableSub : public rclcpp::Node
         [this](const Envelope::ConstSharedPtr msg,
                const rclcpp::MessageInfo& info) { this->rp_cb(msg, info); });
 
-    RCLCPP_INFO(this->get_logger(), "Started the node");
+    RCLCPP_INFO(this->get_logger(),
+                "ReliableSub started: qos_depth=%zu",
+                qos_history_depth_);
   }
 
  private:
@@ -166,4 +176,6 @@ class ReliableSub : public rclcpp::Node
 
   std::string input_topic_name_, subscribe_topic_name_, publish_topic_name_,
       feedback_topic_name_;
+
+  size_t qos_history_depth_;
 };
